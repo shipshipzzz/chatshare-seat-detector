@@ -1,8 +1,8 @@
 // ==UserScript==
-// @name         Chatshare 5.6 Pro 真实模型检测工具 v4
+// @name         Chatshare Pro 模型检测工具 v4.1
 // @namespace    http://tampermonkey.net/
-// @version      4.0.0
-// @description  检测 GPT-5.6 Pro 座位真实模型，显示 resolved_model_slug，并注入 thinking_effort
+// @version      4.1.0
+// @description  无消息检测 GPT-6 Pro 可用性，并检测 GPT-5.6 Pro 真实模型 / resolved_model_slug
 // @author       You
 // @match        https://chatshare.xyz/*
 // @icon         https://chatshare.xyz/favicon.ico
@@ -16,12 +16,13 @@
     'use strict';
   
     // -------------------- 常量/配置 --------------------
-    const VERSION = '4.0.0';
+    const VERSION = '4.1.0';
     const LOG = (...args) => console.log(`🎯 [座位检测 v${VERSION}]`, ...args);
   
     const CONFIG = {
       BASE_URL: 'https://chatshare.xyz',
       PRO_MODEL: 'gpt-5-6-pro',
+      PRO_AVAILABILITY_MODEL: 'gpt-6-pro',
 
       // 只信任 resolved_model_slug；model_slug/default_model_slug 可能仍显示请求模型，
       // 即使后端实际已降级到 gpt-5-5-mini。
@@ -637,6 +638,11 @@
       .seat-iq-good::before{content:'IQ✓ ' attr(data-seat-count);position:absolute;top:-10px;left:8px;background:linear-gradient(135deg,#2196f3,#64b5f6);color:#fff;padding:3px 8px;border-radius:8px;font-size:10px;font-weight:700;z-index:1001;box-shadow:0 2px 6px rgba(33,150,243,.4);pointer-events:none}
       .seat-iq-bad::before{content:'IQ✗ ' attr(data-seat-count);position:absolute;top:-10px;left:8px;background:linear-gradient(135deg,#9e9e9e,#bdbdbd);color:#fff;padding:3px 8px;border-radius:8px;font-size:10px;font-weight:700;z-index:1001;box-shadow:0 2px 6px rgba(158,158,158,.4);pointer-events:none}
 
+      /* GPT-6 Pro 无消息可用性标签（来自 carpage.model_limits） */
+      .seat-pro-availability-label{position:absolute;bottom:-10px;left:8px;padding:3px 8px;border-radius:8px;font-size:10px;font-weight:700;color:#fff;z-index:1002;pointer-events:none;white-space:nowrap;box-shadow:0 2px 6px rgba(0,0,0,.3);font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',Roboto,sans-serif}
+      .seat-pro-availability-label.pro-available{background:linear-gradient(135deg,#2e7d32,#66bb6a)}
+      .seat-pro-availability-label.pro-limited{background:linear-gradient(135deg,#c62828,#ef5350)}
+
       @keyframes seat-glow-iq-good{0%,100%{box-shadow:0 0 15px rgba(76,175,80,.5),inset 0 0 10px rgba(76,175,80,.1)}50%{box-shadow:0 0 25px rgba(76,175,80,.7),0 0 45px rgba(76,175,80,.3),inset 0 0 15px rgba(76,175,80,.15)}}
   
       /* 统计浮窗 */
@@ -677,6 +683,77 @@
       }
       return true;
     }
+
+    function getProModelLimit(seat, model = CONFIG.PRO_AVAILABILITY_MODEL) {
+      const limits = seat?.model_limits;
+      if (!limits || typeof limits !== 'object') return null;
+      const limit = limits[model];
+      return limit && typeof limit === 'object' ? limit : null;
+    }
+
+    function classifyProAvailability(seat, model = CONFIG.PRO_AVAILABILITY_MODEL) {
+      if (!seat?.isPro) return { status: 'not-pro', available: false, model, limit: null };
+      const limit = getProModelLimit(seat, model);
+      return limit
+        ? { status: 'limited', available: false, model, limit }
+        : { status: 'available', available: true, model, limit: null };
+    }
+
+    function formatDurationCompact(totalSeconds) {
+      const seconds = Number(totalSeconds);
+      if (!Number.isFinite(seconds) || seconds <= 0) return '';
+      const days = Math.floor(seconds / 86400);
+      const hours = Math.floor((seconds % 86400) / 3600);
+      const minutes = Math.floor((seconds % 3600) / 60);
+      if (days > 0) return `${days}d${hours}h`;
+      if (hours > 0) return `${hours}h${minutes}m`;
+      return `${Math.max(1, minutes)}m`;
+    }
+
+    function formatLimitResetTime(limit) {
+      const resetTs = Number(limit?.reset_at_ts);
+      if (!Number.isFinite(resetTs) || resetTs <= 0) return limit?.resets_after || '';
+      try {
+        return new Intl.DateTimeFormat('zh-CN', {
+          timeZone: CONFIG.TIMEZONE,
+          month: '2-digit', day: '2-digit', hour: '2-digit', minute: '2-digit', hour12: false,
+        }).format(new Date(resetTs * 1000));
+      } catch {
+        return new Date(resetTs * 1000).toLocaleString();
+      }
+    }
+
+    function markSeatProAvailability(seatCode, availability) {
+      ensureHighlightStyles();
+      const card = findSeatCard(seatCode);
+      if (!card || !availability || availability.status === 'not-pro') return false;
+      if (getComputedStyle(card).position === 'static') card.style.position = 'relative';
+
+      let label = card.querySelector(':scope > .seat-pro-availability-label');
+      if (!label) {
+        label = document.createElement('div');
+        label.className = 'seat-pro-availability-label';
+        card.appendChild(label);
+      }
+
+      label.className = 'seat-pro-availability-label';
+      if (availability.available) {
+        label.classList.add('pro-available');
+        label.textContent = '6 Pro ✓';
+        label.title = 'GPT-6 Pro 当前未检测到模型限额';
+      } else {
+        const compact = formatDurationCompact(availability.limit?.reset_in);
+        const resetAt = formatLimitResetTime(availability.limit);
+        label.classList.add('pro-limited');
+        label.textContent = `6 Pro 受限${compact ? ` ${compact}` : ''}`;
+        label.title = `GPT-6 Pro 当前受限${resetAt ? `；预计恢复 ${resetAt}` : ''}`;
+      }
+      return true;
+    }
+
+    function clearProAvailabilityMarkers() {
+      document.querySelectorAll('.seat-pro-availability-label').forEach((el) => el.remove());
+    }
   
     function clearAllHighlights() {
       document
@@ -686,6 +763,7 @@
           card.removeAttribute('data-same-as');
           card.removeAttribute('data-seat-count');
         });
+      clearProAvailabilityMarkers();
       clearJuiceMarkers();
       LOG('已清除所有高亮/标识');
     }
@@ -696,19 +774,21 @@
         card.removeAttribute('data-same-as');
         card.removeAttribute('data-seat-count');
       });
+      clearProAvailabilityMarkers();
     }
   
     /**
-     * 按 count + isIQ 组合对座位去重（同 count 且同 isIQ = 疑似同账号）
+     * 按 count + isIQ + GPT-6 Pro 可用状态对座位去重。
+     * 同一底层账号通常共享这些状态；加入 Pro 限额状态可避免把可用/受限账号误合并。
      * @param {Array} proSeats - PRO 座位列表
      * @returns {Object} { unique: 去重后座位, duplicates: 重复座位 }
      */
     function getUniqueProSeats(proSeats) {
-      const groups = new Map(); // "count_isIQ" -> [seats]
+      const groups = new Map();
   
       for (const seat of proSeats) {
-        // 按 count + isIQ 组合分组，避免把不同 isIQ 的座位误判为同账号
-        const key = `${seat.count}_${seat.isIQ}`;
+        const availability = classifyProAvailability(seat);
+        const key = `${seat.count}_${seat.isIQ}_${availability.status}`;
         if (!groups.has(key)) groups.set(key, []);
         groups.get(key).push(seat);
       }
@@ -760,24 +840,29 @@
       return badge;
     }
   
-    function showIQStatsBadge(goodCount, badCount, dupCount = 0, uniqueCount = 0) {
+    function showIQStatsBadge(goodCount, badCount, proAvailableCount, proLimitedCount, dupCount = 0, uniqueCount = 0) {
       const badge = getOrCreateIQBadge();
       badge.style.background = 'linear-gradient(135deg,#667eea 0%,#764ba2 100%)';
       badge.innerHTML = `
-        <div class="stats-row"><span>🎯 PRO座位 isIQ 检测</span></div>
+        <div class="stats-row"><span>🎯 PRO 座位快速检测</span></div>
         <div class="stats-row">
-          <span>正常: <span class="good-count">${goodCount}</span></span>
+          <span>IQ正常: <span class="good-count">${goodCount}</span></span>
           <span>|</span>
-          <span>降智: <span class="bad-count">${badCount}</span></span>
+          <span>IQ降智: <span class="bad-count">${badCount}</span></span>
+        </div>
+        <div class="stats-row">
+          <span>6 Pro可用: <span class="good-count">${proAvailableCount}</span></span>
+          <span>|</span>
+          <span>6 Pro受限: <span class="bad-count">${proLimitedCount}</span></span>
           ${dupCount > 0 ? `<span>|</span><span>同账号: <span style="color:#aaa;">${dupCount}</span></span>` : ''}
         </div>
         ${uniqueCount > 0 ? `<div class="stats-row" style="font-size:11px;opacity:.8;">唯一账号: ${uniqueCount} 个</div>` : ''}
-        <div class="stats-row" style="font-size:11px;opacity:.8;">点击打开检测面板</div>
+        <div class="stats-row" style="font-size:11px;opacity:.8;">6 Pro 状态来自 model_limits，不发送测试消息</div>
       `;
     }
   
     async function autoDetectAndHighlightIQ() {
-      LOG('开始自动检测 isIQ 状态...');
+      LOG('开始自动检测 isIQ + GPT-6 Pro 可用性...');
       try {
         const json = await apiJson(API.CAR_PAGE, { method: 'POST', body: { page: 1, size: 999 } });
         const seats = json?.data?.list;
@@ -786,42 +871,65 @@
         const proSeats = seats.filter((s) => s?.isPro === true);
         await sleep(500); // 等待 DOM 座位卡片渲染
   
-        // 按 count + isIQ 去重（站点没有直接暴露底层账号 ID，这仍是启发式规则）
         const { unique, duplicates } = getUniqueProSeats(proSeats);
         LOG(`PRO座位: ${proSeats.length}, 唯一账号: ${unique.length}, 重复座位: ${duplicates.length}`);
   
-        // 先标记所有座位的 isIQ 状态
         let good = 0;
         let bad = 0;
+        let proAvailable = 0;
+        let proLimited = 0;
+        const limitedSeats = [];
+
         for (const seat of proSeats) {
           if (!seat?.carID) continue;
+
           if (highlightSeatByIQ(seat.carID, !!seat.isIQ, seat.count)) {
             seat.isIQ ? good++ : bad++;
           }
-        }
-  
-        // 再标记重复座位（不移除 isIQ 标记，叠加显示）
-        for (const dupSeat of duplicates) {
-          if (!dupSeat?.carID) continue;
-          // 找到这个座位对应的主座位（unique中 count+isIQ 相同的那个）
-          const mainSeat = unique.find(u => u.count === dupSeat.count && u.isIQ === dupSeat.isIQ);
-          if (mainSeat?.carID) {
-            highlightSeatAsDuplicate(dupSeat.carID, mainSeat.carID);
+
+          const availability = classifyProAvailability(seat);
+          if (markSeatProAvailability(seat.carID, availability)) {
+            if (availability.available) {
+              proAvailable++;
+            } else {
+              proLimited++;
+              limitedSeats.push({
+                carID: seat.carID,
+                resetIn: availability.limit?.reset_in ?? null,
+                resetAt: formatLimitResetTime(availability.limit) || availability.limit?.resets_after || null,
+              });
+            }
           }
         }
   
-        LOG(`isIQ 检测完成: ${good} 正常, ${bad} 降智, ${duplicates.length} 同账号跳过`);
-        showIQStatsBadge(good, bad, duplicates.length, unique.length);
+        // 再标记重复座位（不移除 IQ / 6 Pro 状态，叠加显示）
+        for (const dupSeat of duplicates) {
+          if (!dupSeat?.carID) continue;
+          const dupAvailability = classifyProAvailability(dupSeat);
+          const mainSeat = unique.find((u) => (
+            u.count === dupSeat.count
+            && u.isIQ === dupSeat.isIQ
+            && classifyProAvailability(u).status === dupAvailability.status
+          ));
+          if (mainSeat?.carID) highlightSeatAsDuplicate(dupSeat.carID, mainSeat.carID);
+        }
+  
+        LOG(`快速检测完成: IQ正常=${good}, IQ降智=${bad}, 6 Pro可用=${proAvailable}, 6 Pro受限=${proLimited}, 同账号=${duplicates.length}`);
+        if (limitedSeats.length) LOG('GPT-6 Pro 受限座位:', limitedSeats);
+        showIQStatsBadge(good, bad, proAvailable, proLimited, duplicates.length, unique.length);
 
         return {
           iqGoodCount: good,
           iqBadCount: bad,
+          proAvailableCount: proAvailable,
+          proLimitedCount: proLimited,
+          limitedSeats,
           dupCount: duplicates.length,
           uniqueCount: unique.length,
           total: proSeats.length,
         };
       } catch (e) {
-        console.error('自动检测 isIQ 失败:', e);
+        console.error('自动检测 isIQ / GPT-6 Pro 可用性失败:', e);
         return null;
       }
     }
@@ -1213,7 +1321,12 @@
         const { unique, duplicates } = getUniqueProSeats(proSeats);
         for (const dup of duplicates) {
           if (!dup?.carID) continue;
-          const main = unique.find((u) => u.count === dup.count && u.isIQ === dup.isIQ);
+          const dupAvailability = classifyProAvailability(dup);
+          const main = unique.find((u) => (
+            u.count === dup.count
+            && u.isIQ === dup.isIQ
+            && classifyProAvailability(u).status === dupAvailability.status
+          ));
           if (main?.carID) highlightSeatAsDuplicate(dup.carID, main.carID);
         }
         jlog(`🧃 Juice 检测: ${unique.length} 个唯一账号待检测 (跳过 ${duplicates.length} 个重复座位)`);
@@ -1334,7 +1447,7 @@
         </style>
   
         <div id="detector-header">
-          <h3 id="detector-title">🔬 5.6 Pro 真实模型检测</h3>
+          <h3 id="detector-title">🔬 Pro 模型检测</h3>
           <button id="detector-close">×</button>
         </div>
   
@@ -1361,7 +1474,7 @@
           </div>
   
           <div style="display:flex;gap:10px;margin-bottom:10px;">
-            <button id="detector-refresh-iq-btn" style="flex:1;padding:12px;background:rgba(33,150,243,.8);color:#fff;border:none;border-radius:10px;font-size:14px;cursor:pointer;transition:all .3s;">🔍 刷新 isIQ 检测</button>
+            <button id="detector-refresh-iq-btn" style="flex:1;padding:12px;background:rgba(33,150,243,.8);color:#fff;border:none;border-radius:10px;font-size:14px;cursor:pointer;transition:all .3s;">🔍 刷新 IQ + 6 Pro 检测</button>
             <button id="detector-clear-highlight-btn" style="flex:0 0 auto;padding:12px 16px;background:rgba(255,255,255,.2);color:#fff;border:1px solid rgba(255,255,255,.3);border-radius:10px;font-size:14px;cursor:pointer;transition:all .3s;">🧹 清除</button>
           </div>
   
@@ -1384,10 +1497,15 @@
         addLog('🧹 已清除所有座位高亮和标识', 'info');
       });
       $('#detector-refresh-iq-btn')?.addEventListener('click', async () => {
-        addLog('🔍 正在刷新 isIQ 检测...', 'info');
+        addLog('🔍 正在刷新 IQ + GPT-6 Pro 可用性检测...', 'info');
         clearIQHighlights();
         const result = await autoDetectAndHighlightIQ();
-        if (result) addLog(`✅ isIQ 检测完成: ${result.iqGoodCount} 正常, ${result.iqBadCount} 降智, ${result.dupCount} 同账号`, 'success');
+        if (result) {
+          addLog(`✅ 快速检测完成: IQ正常 ${result.iqGoodCount}, IQ降智 ${result.iqBadCount}, 6 Pro可用 ${result.proAvailableCount}, 6 Pro受限 ${result.proLimitedCount}, 同账号 ${result.dupCount}`, 'success');
+          for (const limited of result.limitedSeats || []) {
+            addLog(`⏳ ${limited.carID}: GPT-6 Pro 受限${limited.resetAt ? `，恢复 ${limited.resetAt}` : ''}`, 'warning');
+          }
+        }
       });
   
       $('#detector-juice-btn')?.addEventListener('click', async () => {
@@ -1637,7 +1755,7 @@
       mkBtn({
         id: 'detector-trigger-btn',
         html: '🎯',
-        title: '5.6 Pro 真实模型检测工具',
+        title: 'Pro 模型检测：GPT-6 Pro 可用性 + 5.6 真实模型',
         bg: 'linear-gradient(135deg,#667eea 0%,#764ba2 100%)',
       }).addEventListener('click', () => togglePanel('seat-detector-panel', 'usage-query-panel'));
   
@@ -1687,6 +1805,8 @@
         const allSeats = await getCarList();
         const proSeats = filterProSeats(allSeats);
         const available = proSeats.filter((s) => s.status === 1);
+        const pro6Available = proSeats.filter((s) => classifyProAvailability(s).available);
+        const pro6Limited = proSeats.filter((s) => classifyProAvailability(s).status === 'limited');
   
         const statusCount = {
           1: proSeats.filter((s) => s.status === 1).length,
@@ -1698,6 +1818,8 @@
           <div class="account-row"><span class="account-label">用户名</span><span class="account-value">${userInfo.username || '未知'}</span></div>
           <div class="account-row"><span class="account-label">总 PRO 座位</span><span class="account-value">${proSeats.length} 个</span></div>
           <div class="account-row"><span class="account-label">空闲座位</span><span class="account-value" style="color:#4caf50;">${available.length} 个</span></div>
+          <div class="account-row"><span class="account-label">GPT-6 Pro 可用</span><span class="account-value" style="color:#69f0ae;">${pro6Available.length} 个</span></div>
+          <div class="account-row"><span class="account-label">GPT-6 Pro 受限</span><span class="account-value" style="color:#ffab91;">${pro6Limited.length} 个</span></div>
           <div class="account-row">
             <span class="account-label">状态分布</span>
             <span class="account-value">
@@ -1810,7 +1932,7 @@
         createTriggerButtons();
         LOG('脚本已加载', { version: VERSION });
   
-        // 在车队列表页面：仅自动检测 isIQ，不自动发送消息验证
+        // 在车队列表页面：自动检测 isIQ + GPT-6 Pro model_limits；不发送测试消息
         if (location.href.includes('/carlist') || location.href.includes('/#/')) {
           await sleep(1500);
           await autoDetectAndHighlightIQ();
